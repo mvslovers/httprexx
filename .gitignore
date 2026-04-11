@@ -1,0 +1,28 @@
+# Generated files
+*.s
+*.o
+*.d
+
+# Build artifacts
+*.jcl
+.build-warnings
+
+# IDE
+*.geany
+compile_commands.json
+
+# Environment
+.env
+
+# Build system (mbt)
+.mbt/
+contrib/
+dist/
+*.xmit
+
+# Cache
+.cache/
+
+# OS
+.DS_Store
+*:Zone.Identifier
