@@ -1,7 +1,7 @@
 [project]
 name = "httprexx"
 version = "1.0.0-dev"
-type = "application"
+type = "module"
 
 [build]
 cflags = [
