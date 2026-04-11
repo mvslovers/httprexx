@@ -1,6 +1,4 @@
 /* HTTPREXX.C - CGI Program, REST style CGI program to link BREXX and execute script */
-#include "httpcgi.h"
-#include "svc99.h"
 #include "clibary.h"
 #include "clibos.h"
 #include "clibppa.h"
@@ -8,6 +6,9 @@
 #include "clibgrt.h"
 #include "clibwto.h"
 #include "cliblink.h"
+#include "clibthrd.h"
+#include "httpcgi.h"
+#include "svc99.h"
 
 #define httpx   http_get_httpx(httpd)
 

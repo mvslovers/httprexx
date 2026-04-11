@@ -1,8 +1,8 @@
-#include "httpcgi.h"
 #include "clibppa.h"
 #include "clibcrt.h"
 #include "clibgrt.h"
 #include "clibwto.h"
+#include "httpcgi.h"
 
 /* MVS style parameter when called from BREXX for
  * ADDRESS LINKMVS "HTTPVARS var1 .. var15" 

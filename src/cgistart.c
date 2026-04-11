@@ -23,13 +23,13 @@
    the EXEC statement in the JCL.
 */
 
-#include "httpcgi.h"
 #include "clibppa.h"
 #include "clibcrt.h"
 #include "clibenv.h"
 #include "clibwto.h"
 #include "clibgrt.h"
 #include "clibary.h"
+#include "httpcgi.h"
 
 #define MAXPARMS 50 /* maximum number of arguments we can handle */
 

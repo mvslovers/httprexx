@@ -45,7 +45,7 @@ space = ["TRK", 20, 10, 5]
 
 [dependencies]
 "mvslovers/crent370" = ">=1.0.9"
-"mvslovers/httpd" = ">=4.0.0-dev"
+"mvslovers/httpd" = "=4.0.0-dev"
 
 # --- Load Modules ------------------------------------------------
 
