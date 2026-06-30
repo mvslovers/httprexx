@@ -1,67 +1,28 @@
 [project]
 name = "httprexx"
 version = "1.0.0-dev"
-type = "module"
+# CGI handler load module (REXX Server Pages). The rexx370 IRX services are
+# resolved at runtime against the modules already installed on the system
+# (IRXINIT/IRXEXEC/IRXTERM), so rexx370 is NOT a build dependency — only its
+# headers are vendored under include/ (see doc/rexx370-bindings.md).
+type = "application"
 
 [build]
-cflags = [
-	"-O1",
-]
+# gnu99 for the CGI glue (mixed decls, // comments, snprintf, stdbool).
+# -I include picks up httprexx's own headers and the vendored IRX headers.
+cflags = ["-std=gnu99", "-I", "include"]
 
-[build.sources]
-c_dirs = ["src/"]
-
-[mvs.build.datasets.source]
-suffix = "SOURCE"
-dsorg = "PO"
-recfm = "FB"
-lrecl = 80
-blksize = 19040
-space = ["TRK", 30, 10, 20]
-
-[mvs.build.datasets.punch]
-suffix = "OBJECT"
-dsorg = "PO"
-recfm = "FB"
-lrecl = 80
-blksize = 19040
-space = ["TRK", 20, 10, 20]
-
-[mvs.build.datasets.ncalib]
-suffix = "NCALIB"
-dsorg = "PO"
-recfm = "U"
-lrecl = 0
-blksize = 19069
-space = ["TRK", 20, 10, 20]
-
-[mvs.build.datasets.syslmod]
-suffix = "LOAD"
-dsorg = "PO"
-recfm = "U"
-lrecl = 0
-blksize = 15040
-space = ["TRK", 20, 10, 5]
+# ── Load module: the REXX CGI handler ───────────────────────────────
+# startup=crt1 for the threading runtime (@@CRT1), same as httplua. The CGI
+# entry calls main(); httpd/httpc come from the GRT (grtapp1/grtapp2).
+[[module]]
+name = "HTTPREXX"
+startup = "crt1"
+sources = ["src/*.c"]
 
 [dependencies]
-"mvslovers/crent370" = ">=1.0.9"
 "mvslovers/httpd" = "=4.0.0-dev"
-
-# --- Load Modules ------------------------------------------------
-
-# BREXX say helper (@@CRTM instead of @@CRT1)
-[[link.module]]
-name = "HTTPSAY"
-entry = "@@CRT0"
-options = ["LIST", "MAP", "XREF", "RENT"]
-include = ["@@CRTM", "HTTPSAY"]
-
-# REXX CGI handler
-[[link.module]]
-name = "HTTPREXX"
-entry = "@@CRT0"
-options = ["LIST", "MAP", "XREF", "RENT"]
-include = ["@@CRT1", "CGISTART", "HTTPREXX"]
+"mvslovers/ufsd" = "=1.0.0-dev"
 
 [release]
 version_files = ["VERSION"]
