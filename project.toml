@@ -20,6 +20,13 @@ name = "HTTPREXX"
 startup = "crt1"
 sources = ["src/*.c"]
 
+# ── Tests (host-runnable: make test-host) ───────────────────────────
+# The .rxp transpiler is pure C; its unit test cross-compiles and runs
+# natively for a fast inner loop, and as an MVS load module under make test.
+[[test]]
+name = "TSTRXP"
+sources = ["test/tstrxp.c", "src/rxptrans.c"]
+
 [dependencies]
 "mvslovers/httpd" = "=4.0.0-dev"
 "mvslovers/ufsd" = "=1.0.0-dev"
