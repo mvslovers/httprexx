@@ -174,16 +174,15 @@ static int send_error(HTTPD *httpd, HTTPC *httpc, int code)
     return 0;
 }
 
-/* default content type text/html (spec section 6); body is raw EBCDIC bytes,
- * translated to ASCII on the wire by httpd. */
-static int send_page(HTTPD *httpd, HTTPC *httpc, const char *body, size_t len)
+/* default content type text/html (spec section 6). The body is emitted with
+ * http_printf (the text path), so httpd translates EBCDIC->ASCII on the wire --
+ * same as httplua. `body` must be NUL-terminated; a rendered page is text. */
+static int send_page(HTTPD *httpd, HTTPC *httpc, const char *body)
 {
     http_resp(httpc, 200);
     http_printf(httpc, "Content-Type: text/html\r\n");
     http_printf(httpc, "\r\n");
-    if (len) {
-        http_send(httpc, (void *)body, (int)len);
-    }
+    http_printf(httpc, "%s", body);
     return 0;
 }
 
@@ -226,7 +225,7 @@ static int run_rexx(HTTPD *httpd, HTTPC *httpc, char *program, size_t prog_len,
     IRX_ARGTABLE_ENTRY  argt[2];
     unsigned            vexec[10];
 
-    ctx.buf = (char *)malloc(HRX_OUT_MAX);
+    ctx.buf = (char *)malloc(HRX_OUT_MAX + 1);   /* +1 for the NUL terminator */
     if (!ctx.buf) {
         return send_error(httpd, httpc, 500);
     }
@@ -237,7 +236,7 @@ static int run_rexx(HTTPD *httpd, HTTPC *httpc, char *program, size_t prog_len,
     ent = build_instblk(program, prog_len, &ib, &nlines);
     if (!ent) {
         free(ctx.buf);
-        return send_page(httpd, httpc, "", 0);   /* empty program -> empty page */
+        return send_page(httpd, httpc, "");       /* empty program -> empty page */
     }
 
     /* --- IRXINIT: create a fresh LPE --- */
@@ -301,7 +300,8 @@ static int run_rexx(HTTPD *httpd, HTTPC *httpc, char *program, size_t prog_len,
 done:
     free(ent);
     if (ok) {
-        rc = send_page(httpd, httpc, ctx.buf, ctx.len);
+        ctx.buf[ctx.len] = '\0';
+        rc = send_page(httpd, httpc, ctx.buf);
     } else {
         rc = send_error(httpd, httpc, 500);
     }
