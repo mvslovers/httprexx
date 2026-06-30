@@ -1,0 +1,6 @@
+<?rexx parse arg name; if name = '' then name = 'World' ?>
+<h1>Hello, <?rexx= name ?>!</h1>
+<?rexx items = 'Hercules MVS REXX'
+do i = 1 to words(items) ?>
+  <li><?rexx= word(items, i) ?></li>
+<?rexx end ?>
