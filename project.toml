@@ -18,7 +18,7 @@ cflags = ["-std=gnu99", "-I", "include"]
 [[module]]
 name = "HTTPREXX"
 startup = "crt1"
-sources = ["src/*.c"]
+sources = ["src/*.c", "asm/*.asm"]
 
 # ── Tests (host-runnable: make test-host) ───────────────────────────
 # The .rxp transpiler is pure C; its unit test cross-compiles and runs
