@@ -99,6 +99,22 @@ static int httprexx_io(int function, IRX_LSTR *data, IRX_ENVBLOCK *env)
     }
 }
 
+/* Remove CR (0x0D) bytes in place -- tolerate CRLF line endings in the source
+ * so the transpiler and the REXX tokenizer see clean, newline-only text.
+ * Returns the new length. */
+static size_t strip_cr(char *buf, size_t len)
+{
+    size_t r;
+    size_t w = 0;
+
+    for (r = 0; r < len; r++) {
+        if (buf[r] != '\r') {
+            buf[w++] = buf[r];
+        }
+    }
+    return w;
+}
+
 /* ------------------------------------------------------------------ */
 /*  in-storage source (INSTBLK)                                      */
 /* ------------------------------------------------------------------ */
@@ -176,15 +192,21 @@ static int send_error(HTTPD *httpd, HTTPC *httpc, int code)
     return 0;
 }
 
-/* default content type text/html (spec section 6). The body is emitted with
- * http_printf (the text path), so httpd translates EBCDIC->ASCII on the wire --
- * same as httplua. `body` must be NUL-terminated; a rendered page is text. */
-static int send_page(HTTPD *httpd, HTTPC *httpc, const char *body)
+/* default content type text/html (spec section 6). The body comes from UFS,
+ * which stores IBM-1047 -- translate it EBCDIC(1047)->ASCII with the 1047 table
+ * and send it raw, exactly as httpd's static-file path does (httpfile.c). The
+ * server default (often CP037) would mangle the variant characters [ ] { } # @
+ * | that differ between CP037 and IBM-1047. Headers are invariant, so the
+ * http_printf default codepage is fine for them. */
+static int send_page(HTTPD *httpd, HTTPC *httpc, char *body, size_t len)
 {
     http_resp(httpc, 200);
     http_printf(httpc, "Content-Type: text/html\r\n");
     http_printf(httpc, "\r\n");
-    http_printf(httpc, "%s", body);
+    if (len) {
+        http_xlate((unsigned char *)body, (int)len, httpx->xlate_1047->etoa);
+        http_send(httpc, (unsigned char *)body, (int)len);
+    }
     return 0;
 }
 
@@ -238,7 +260,7 @@ static int run_rexx(HTTPD *httpd, HTTPC *httpc, char *program, size_t prog_len,
     ent = build_instblk(program, prog_len, &ib, &nlines);
     if (!ent) {
         free(ctx.buf);
-        return send_page(httpd, httpc, "");       /* empty program -> empty page */
+        return send_page(httpd, httpc, NULL, 0);   /* empty program -> empty page */
     }
 
     /* --- IRXINIT: create a fresh LPE --- */
@@ -286,9 +308,14 @@ static int run_rexx(HTTPD *httpd, HTTPC *httpc, char *program, size_t prog_len,
     vexec[9] = (unsigned)&rexxrc | 0x80000000U;   /* last slot: VL marker */
     rc = __linkds("IRXEXEC", NULL, vexec, &prc);
 
-    /* --- IRXTERM: free the LPE (always, even if IRXEXEC failed). Obtain the
-     * entry via __load (the loader rexx370 uses; the as370 LOAD macro's
-     * return-code form is not honored by MVS 3.8j) and call it with R0=env. */
+    /* --- IRXTERM: temporarily DISABLED. Terminating an env AFTER an IRXEXEC
+     * run S0C1s early inside IRXTERM (ttermvl only covers IRXINIT->IRXTERM with
+     * no exec in between; the entry via __load/HRXCALL is the same LOAD+BALR-R0
+     * path ttermvl uses and works there). The LPE is leaked per request until
+     * the rexx370 IRXTERM-after-IRXEXEC path is fixed; the IRXANCHR table holds
+     * ~64 slots, so a smoke test of a few requests is fine. The __load/HRXCALL
+     * code is kept below (compiled out) for a one-line re-enable. */
+#if 0
     {
         unsigned int lsize = 0;
         char         lac   = 0;
@@ -296,10 +323,9 @@ static int run_rexx(HTTPD *httpd, HTTPC *httpc, char *program, size_t prog_len,
         if (ep) {
             hrx_call(ep, env);
             __delete("IRXTERM");
-        } else {
-            wtof("HTTPREXX: IRXTERM load failed; LPE not freed");
         }
     }
+#endif
 
     if (rc != 0 || prc != 0) {
         wtof("HTTPREXX: IRXEXEC failed link=%d rc=%d rexxrc=%d", rc, prc, rexxrc);
@@ -314,8 +340,7 @@ static int run_rexx(HTTPD *httpd, HTTPC *httpc, char *program, size_t prog_len,
 done:
     free(ent);
     if (ok) {
-        ctx.buf[ctx.len] = '\0';
-        rc = send_page(httpd, httpc, ctx.buf);
+        rc = send_page(httpd, httpc, ctx.buf, ctx.len);
     } else {
         rc = send_error(httpd, httpc, 500);
     }
@@ -379,6 +404,10 @@ static int dispatch(HTTPD *httpd, HTTPC *httpc, const char *script)
     if (!src) {
         return send_error(httpd, httpc, 404);
     }
+
+    /* tolerate CRLF line endings: strip CR so the transpiler and the REXX
+     * tokenizer see clean, newline-only text */
+    src_len = strip_cr(src, src_len);
 
     query = http_get_env(httpc, "QUERY_STRING");
 
