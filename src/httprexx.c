@@ -1,593 +1,459 @@
-/* HTTPREXX.C - CGI Program, REST style CGI program to link BREXX and execute script */
+/* HTTPREXX.C - CGI handler for REXX Server Pages (.rexx / .rxp).
+ *
+ * Drives the rexx370 IRX services (installed as load modules) to run a REXX
+ * program per request and capture its SAY output into the HTTP response:
+ *
+ *   read .rexx/.rxp from UFS  ->  (.rxp: transpile to REXX)  ->  IRXINIT a fresh
+ *   LPE  ->  overwrite IRXEXTE.io_routine with httprexx_io  ->  IRXEXEC the
+ *   in-storage source  ->  IRXTERM  ->  flush the buffered page to httpc.
+ *
+ * The IRX services are reached at runtime via the MVS LINK service (__linkds);
+ * rexx370 is not linked in -- only its struct layouts are reproduced locally in
+ * irxbind.h. See doc/rexx370-bindings.md for the full contract.
+ */
 #include "clibary.h"
-#include "clibos.h"
 #include "clibppa.h"
 #include "clibcrt.h"
-#include "clibgrt.h"
 #include "clibwto.h"
+#include "clibgrt.h"
 #include "cliblink.h"
-#include "clibthrd.h"
+#include "clibos.h"
+#include "libufs.h"
 #include "httpcgi.h"
-#include "svc99.h"
 
-#define httpx   http_get_httpx(httpd)
+#include <stdlib.h>
+#include <string.h>
 
-static int link_rexx(HTTPD *httpd, HTTPC *httpc, const char *script);
+#include "irxbind.h"
+#include "rxptrans.h"
 
-int main(int argc, char **argv)
+/* The httpd v4 macro layer (http_resp/http_send/...) routes through the HTTPX
+ * vector and needs `httpx` in scope; resolve it from the `httpd` pointer that
+ * every function below holds (same convention as httplua). */
+#define httpx http_get_httpx(httpd)
+
+/* Caps. The output buffer is fixed so the SAY path never reallocs from inside
+ * IRXEXEC's call context; overflow is flagged and the request fails cleanly.
+ * (Streaming large responses is a Phase-2 concern -- spec section 6.) */
+#define HRX_SRC_MAX  (64u * 1024u)   /* max .rexx/.rxp source read from UFS */
+#define HRX_OUT_MAX  (32u * 1024u)   /* max rendered page (buffered)        */
+
+/* Call a routine with the ENVBLOCK in R0 (asm/htrxterm.asm). IRXTERM's entry
+ * point is obtained in C via __load(); this shim just calls it with R0 = env. */
+extern int hrx_call(void *ep, void *env) asm("HRXCALL");
+
+/* the CGI entry (@@CRT1 __start) calls main() */
+int main(int argc, char **argv);
+
+/* Request context, reached from httprexx_io via the ENVBLOCK user field. */
+typedef struct {
+    char  *buf;        /* fixed output buffer (no realloc on the SAY path) */
+    size_t cap;
+    size_t len;
+    int    overflow;
+} reqctx_t;
+
+/* ------------------------------------------------------------------ */
+/*  I/O replaceable routine: SAY -> buffer (heap-free)               */
+/* ------------------------------------------------------------------ */
+
+/* Bound to IRXEXTE.io_routine after IRXINIT. Runs nested inside IRXEXEC's call
+ * context, so it touches no heap: it only memcpy's into the pre-allocated
+ * buffer. Recovers the request context from env->userfield (no globals). */
+static int httprexx_io(int function, IRX_LSTR *data, IRX_ENVBLOCK *env)
 {
-    int         rc      = 0;
-    CLIBPPA     *ppa    = __ppaget();
-    CLIBGRT     *grt    = __grtget();
-    CLIBCRT		*crt	= __crtget();
-    void		*crtapp1= NULL;
-    void		*crtapp2= NULL;
-    HTTPD       *httpd  = grt->grtapp1;
-    HTTPC       *httpc  = grt->grtapp2;
-    char        *path   = NULL;
-    char        *script = NULL;
+    reqctx_t *ctx = env ? (reqctx_t *)env->userfield : NULL;
 
-    if (!httpd) {
-        wtof("This program %s must be called by the HTTPD web server%s", argv[0], "");
-        /* TSO callers might not see a WTO message, so we send a STDOUT message too */
-        printf("This program %s must be called by the HTTPD web server%s", argv[0], "\n");
-        return 12;
+    switch (function) {
+    case RXFWRITE:                       /* SAY: append the line + newline */
+        if (ctx && data) {
+            size_t n = data->len;
+            if (ctx->len + n + 1 > ctx->cap) {
+                ctx->overflow = 1;       /* drop -- do not grow */
+            } else {
+                if (n && data->pstr) {
+                    memcpy(ctx->buf + ctx->len, data->pstr, n);
+                    ctx->len += n;
+                }
+                ctx->buf[ctx->len++] = '\n';
+            }
+        }
+        return 0;
+
+    case RXFTWRITE:                      /* trace / error -> log, not body */
+    case RXFWRITERR:
+        if (data && data->pstr && data->len) {
+            wtof("HTTPREXX: %.*s", (int)data->len, (char *)data->pstr);
+        }
+        return 0;
+
+    case RXFREAD:                        /* PULL: EOF in Phase 1 (spec 4.2) */
+    case RXFREADP:
+        if (data) {
+            data->len = 0;               /* empty line */
+        }
+        return 0;
+
+    default:                             /* EXECIO / open / close: Phase 2 */
+        return 0;
+    }
+}
+
+/* ------------------------------------------------------------------ */
+/*  in-storage source (INSTBLK)                                      */
+/* ------------------------------------------------------------------ */
+
+/* Build an INSTBLK over a REXX source buffer: one entry per source line
+ * (newline excluded). The source must outlive the IRXEXEC call -- the entries
+ * point into it. Returns the malloc'd entry array (caller frees) and fills
+ * *ib; returns NULL on OOM or an empty program. */
+static IRX_INSTBLK_ENTRY *build_instblk(char *src, size_t len,
+                                        IRX_INSTBLK *ib, int *nlines_out)
+{
+    IRX_INSTBLK_ENTRY *ent;
+    int    nlines = 0;
+    int    k;
+    size_t i;
+    size_t start;
+
+    /* count lines (a trailing newline adds no empty final line) */
+    start = 0;
+    for (i = 0; i <= len; i++) {
+        if (i == len || src[i] == '\n') {
+            if (i == len && i == start) {
+                break;
+            }
+            nlines++;
+            start = i + 1;
+        }
+    }
+    if (nlines == 0) {
+        return NULL;
     }
 
-	/* save for our exit/exterbnal programs */
-	if (crt) {
-		crtapp1			= crt->crtapp1;
-		crtapp2			= crt->crtapp2;
-		crt->crtapp1	= httpd;
-		crt->crtapp2	= httpc;
-	}
-	
-	// wtof("%s: enter", argv[0]);
-
-	// wtof("%s: ppa=0x%08X grt=0x%08X httpd=0x%08X httpc=0x%08X",
-	// 	argv[0], ppa, grt, httpd, httpc);
-
-    /* get the request path string */
-    path = http_get_env(httpc, "REQUEST_PATH");
-    script = strrchr(path, '/');
-    
-    // wtof("%s: path=\"%s\"", argv[0], path);
-    // wtof("%s: script=\"%s\"", argv[0], path);
-
-	if (script) {
-		rc = link_rexx(httpd, httpc, script);
-	}
-
-quit:
-	if (crt) {
-		/* restore crt values */
-		crt->crtapp1	= crtapp1;
-		crt->crtapp2	= crtapp2;
-	}
-
-	// wtof("%s: exit rc=%d", argv[0], rc);
-    return rc;
-}
-
-static int link(HTTPD *httpd, HTTPC *httpc, const char *pgm, const char *script);
-static int alloc_dummy(const char *ddanme);
-static int alloc_temp(const char *ddname);
-static int alloc_temp_vars(const char *ddname);
-static int free_alloc(const char *ddname);
-static int process_stdout(HTTPD *httpd, HTTPC *httpc);
-static int process_stderr(HTTPD *httpd, HTTPC *httpc, const char *script);
-static int process_abend(HTTPD *httpd, HTTPC *httpc, int rc);
-static int create_vars(HTTPD *httpd, HTTPC *httpc);
-
-static int 
-link_rexx(HTTPD *httpd, HTTPC *httpc, const char *script)
-{
-	int			rc			= 0;
-	int			lockrc		= 0;
-	int			lines		= 0;
-	int			errors		= 0;
-	void 		*httpsay	= NULL;
-    void        *dcb    	= 0;
-    unsigned    size    	= 0;
-    char        ac      	= 0;
-    CDE         *cde;
-
-	// wtof("%s: enter", __func__);
-
-    /* get the steplib DCB */
-    dcb 	= __steplb();
-    /* load the HTTPSAY module into storage */
-	httpsay = __load(dcb, "HTTPSAY ", &size, &ac);
-	
-	// wtof("%s: HTTPSAY ep=%08X size=%u, ac=%u", __func__, httpsay, size, ac);
-
-	/* Serialize (lock) the address of this function so that 
-	 * only one CGI instance (for BREXX) runs at a time.
-	 */
-	lockrc = lock(link_rexx, LOCK_EXC);
-
-    while(*script=='/') script++;
-
-	/* just in case we have stale allocations */
-	free_alloc("STDIN");
-	free_alloc("STDOUT");
-	free_alloc("STDERR");
-
-	/* allocate dataset for BREXX */
-    rc = alloc_dummy("STDIN");
-    if (rc) goto quit;
-    
-    rc = alloc_temp("STDOUT");
-    if (rc) goto quit;
-    
-    rc = alloc_temp("STDERR");
-    if (rc) goto quit;
-    
-    /* write server/client variables to "DD:HTTPVARS" */
-	rc = create_vars(httpd, httpc);
-	if (rc) goto quit;
-    
-    /* link to external program */
-    rc = link(httpd, httpc, "BREXX", script);
-    if (rc < 0) process_abend(httpd, httpc, rc);
-
-	/* create response using STDOUT dataseet */
-	lines = process_stdout(httpd, httpc);
-
-	/* process any errors found in STDERR dataset */
-	errors = process_stderr(httpd, httpc, script);
-
-deallocate:
-	/* release allocations */
-	free_alloc("STDIN");
-	free_alloc("STDOUT");
-	free_alloc("STDERR");
-	free_alloc("HTTPVARS");
-
-quit:
-	if (lockrc==0) 	unlock(link_rexx, LOCK_EXC);
-
-	if (httpsay) __delete("HTTPSAY ");
-
-	if (!httpc->resp) {
-		http_resp(httpc,503);   
-		http_printf(httpc, "Content-Type: %s\r\n", "text/plain");
-		http_printf(httpc, "\r\n");
-		http_printf(httpc, "One or more errors occurred processing your request\n");
-	}
-
-    httpc->state = CSTATE_DONE;
-	// wtof("%s: exit rc=%d", __func__, rc);
-	return rc;
-}
-
-static int 
-link(HTTPD *httpd, HTTPC *httpc, const char *pgm, const char *script)
-{
-    void        *ppa    = NULL;
-    int         rc      = -1;   /* link return code     */
-    int         prc     = -1;   /* pgm return code      */
-    void        *dcb    = NULL; /* no DCB for link      */
-    char 		*query;
-    struct {
-        unsigned short  len;
-        char            buf[512];
-    } parms = {0, ""};
-    unsigned    plist[4];
-
-	// wtof("%s: enter", __func__);
-
-    if (!pgm) goto quit;    /* NULL program, quit       */
-    if (!*pgm) goto quit;   /* "" program name, quit    */
-
-    query = http_get_env(httpc, "QUERY_STRING");
-	if (!query) query = "";
-
-    if (script) {
-        /* put request in quotes as parameter string */
-        snprintf(parms.buf, sizeof(parms.buf)-1, "%s \"%s\"", script, query);
-        parms.buf[sizeof(parms.buf)-1] = 0;
-        parms.len = strlen(parms.buf);
+    ent = (IRX_INSTBLK_ENTRY *)malloc((size_t)nlines * sizeof(IRX_INSTBLK_ENTRY));
+    if (!ent) {
+        return NULL;
     }
 
-	// wtodumpf(&parms, sizeof(parms), "%s: parms", __func__);
-
-    /* build parameter list for the program we're linking to */
-    plist[0]    = (unsigned)&parms | 0x80000000;
-    plist[1]    = 0;
-    plist[2]    = 0;
-    plist[3]    = 0;
-
-	// wtodumpf(plist, sizeof(plist), "%s: plist", __func__);
-
-    /* link to pgm, with ESTAE */
-    rc = __linkds(pgm, dcb, plist, &prc);
-    // wtof("%s: __linkds(\"%s\",0,0x%08X,0x%08X) rc=%d prc=%d",
-	// 	__func__, pgm, plist, &prc, rc, prc);
-	
-	if (rc==0) rc = prc;
-	
-quit:
-	// wtof("%s: exit rc=%d", __func__, rc);
-	return rc;
-}
-
-static int 
-create_vars(HTTPD *httpd, HTTPC *httpc)
-{
-	int			rc		= 0;
-	FILE		*fp		= NULL;
-	char 		*p;
-	char 		name[256];
-
-	free_alloc("HTTPVARS");
-
-    rc = alloc_temp_vars("HTTPVARS");
-    if (rc) goto quit;
-
-	/* create dataset containing client variables */
-	fp = fopen("DD:HTTPVARS", "w");
-	if (!fp) goto quit;
-
-    if (httpc->env) {
-        unsigned count = array_count(&httpc->env);
-        unsigned n;
-        for(n=0;n<count;n++) {
-			HTTPV *env = httpc->env[n];
-			
-			if (!env) continue;
-
-			/* BREXX doesn't permit variable names with '-' in the name
-			 * so we'll transform those to underscore characters.
-			 */
-			strcpy(name, env->name);
-			for(p=strchr(name,'-'); p; p=strchr(name,'-')) *p = '_'; 
-			fprintf(fp, "%s=\"%s\"\n", name, env->value);
-			// wtof("%s: %s=\"%s\"", __func__, name, env->value);
+    k = 0;
+    start = 0;
+    for (i = 0; i <= len; i++) {
+        if (i == len || src[i] == '\n') {
+            if (i == len && i == start) {
+                break;
+            }
+            ent[k].stmt = src + start;
+            ent[k].len  = (int)(i - start);
+            k++;
+            start = i + 1;
         }
     }
 
-quit:
-	if (fp) fclose(fp);
-	return rc;
+    memset(ib, 0, sizeof(*ib));
+    memcpy(ib->acronym, IRX_INSTBLK_ID, 8);
+    ib->hdrlen  = IRX_INSTBLK_HDRLEN;
+    ib->address = ent;
+    ib->usedlen = nlines * (int)sizeof(IRX_INSTBLK_ENTRY);
+    memset(ib->member, ' ', 8);          /* blank for PARSE SOURCE */
+    memset(ib->ddname, ' ', 8);
+    memset(ib->subcom, ' ', 8);
+
+    *nlines_out = nlines;
+    return ent;
 }
 
-static int 
-process_stdout(HTTPD *httpd, HTTPC *httpc)
+/* ------------------------------------------------------------------ */
+/*  responses                                                        */
+/* ------------------------------------------------------------------ */
+
+static int send_error(HTTPD *httpd, HTTPC *httpc, int code)
 {
-	int			lines	= 0;
-	FILE		*fp		= NULL;
-	char		*p		= NULL;
-	char 		buf[256];
-
-	/* create response */
-	fp = fopen("DD:STDOUT", "r");
-	// wtof("%s: fopen(\"DD:STDOUT\",\"r\") fp=0x%08X", __func__, fp);
-	if (!fp) goto quit;
-
-	while(p=fgets(buf, sizeof(buf), fp)) {
-		if (!lines) {
-			if (!httpc->resp && __patmat(buf, "HTTP/?.? *")) {
-				/* looks like a HTTP response header */
-				char *tmp = strdup(buf);
-				if (tmp) {
-					char *p1 = strtok(tmp, " ");	/* HTTP/1.0 */
-					char *p2 = strtok(NULL, " ");	/* nnn */
-					char *p3 = strtok(NULL, "");	/* OK or whatever */
-					
-					if (p2) httpc->resp = atoi(p2);
-					free(tmp);
-				}
-			}
-
-			if (!httpc->resp) {
-				/* we don't have a HTTP response */
-				http_resp(httpc,200);
-				while(*p==' ') p++;
-				if (p[0]=='<') {
-					/* looks like a HTML markup tag */
-					http_printf(httpc, "Content-Type: %s\r\n", "text/html");
-				}
-				else {
-					/* anything else */
-					http_printf(httpc, "Content-Type: %s\r\n", "text/plain");
-				}
-				http_printf(httpc, "\r\n");
-			}
-		}
-		http_printf(httpc, "%s", buf);
-		lines++;
-	}
-
-quit:
-	if (fp) fclose(fp);
-
-	return lines;
+    http_resp(httpc, code);
+    http_printf(httpc, "Content-Type: text/plain\r\n");
+    http_printf(httpc, "\r\n");
+    http_printf(httpc, "HTTPREXX: error processing request (%d)\n", code);
+    return 0;
 }
 
-static int
-process_stderr(HTTPD *httpd, HTTPC *httpc, const char *script)
+/* default content type text/html (spec section 6). The body is emitted with
+ * http_printf (the text path), so httpd translates EBCDIC->ASCII on the wire --
+ * same as httplua. `body` must be NUL-terminated; a rendered page is text. */
+static int send_page(HTTPD *httpd, HTTPC *httpc, const char *body)
 {
-	int			errors	= 0;
-	FILE		*fp		= NULL;
-	char		*p		= NULL;
-	char 		buf[256];
-
-	fp = fopen("DD:STDERR", "r");
-	// wtof("%s: fopen(\"DD:STDERR\",\"r\") fp=0x%08X", __func__, fp);
-	if (!fp) goto quit;
-
-	while(p=fgets(buf, sizeof(buf), fp)) {
-		if (!errors) {
-			wtof("HTTPD500I CGI Program BREXX script \"%s\"", script);
-		}
-		// wtodumpf(buf, strlen(buf), "%s: stderr", __func__);
-		/* strip trailing newline */
-		p = strrchr(buf, '\n');
-		if (p) *p = 0;
-
-		wtof("HTTPD501I %s", buf);
-		errors++;
-	}
-
-quit:
-	if (fp) fclose(fp);
-	return errors;
+    http_resp(httpc, 200);
+    http_printf(httpc, "Content-Type: text/html\r\n");
+    http_printf(httpc, "\r\n");
+    http_printf(httpc, "%s", body);
+    return 0;
 }
 
-static int 
-process_abend(HTTPD *httpd, HTTPC *httpc, int rc)
+/* ------------------------------------------------------------------ */
+/*  run an in-storage REXX program                                   */
+/* ------------------------------------------------------------------ */
+
+static int run_rexx(HTTPD *httpd, HTTPC *httpc, char *program, size_t prog_len,
+                    char *query)
 {
-	/* some kind of ABEND occurred */
-	unsigned abcode = (unsigned) (rc * -1);   /* make positive again */
+    reqctx_t           ctx;
+    IRX_INSTBLK        ib;
+    IRX_INSTBLK_ENTRY *ent = NULL;
+    int                nlines = 0;
+    int                ok = 0;
+    int                prc = 0;
+    int                rc;
 
-	/* we're running in the HTTPD server */
-	if (!httpc->resp) {
-		/* no response header was issued by CGI program */
-		http_resp(httpc,503);   
-		http_printf(httpc, "Content-Type: %s\r\n", "text/plain");
-		http_printf(httpc, "\r\n");
-	}
+    /* IRXINIT parameters (the VLIST holds the ADDRESS of each, CALL,VL style) */
+    static const char fcode[] = "INITENVB";
+    void         *p_parmmod = NULL;
+    void         *p_userfld = NULL;
+    void         *p_wkblk   = NULL;
+    void         *p_resv    = NULL;
+    IRX_ENVBLOCK *env       = NULL;
+    int           reason    = 0;
+    unsigned      vinit[7];
 
-	if (abcode > 4095) {
-		/* system abend occurred */
-		http_printf(httpc, "External program %s failed with S%03X ABEND", "BREXX", abcode >> 12);
-        wtof("External program %s failed with S%03X ABEND", "BREXX", abcode >> 12);
-	}
-	else {
-		/* user abend code */
-		http_printf(httpc, "External program %s failed with U%04d ABEND", "BREXX", abcode);
-        wtof("External program %s failed with U%04d ABEND", "BREXX", abcode);
-	}
-	http_printf(httpc, "\n");
+    /* IRXEXEC parameters */
+    void               *p_execblk = NULL;
+    void               *p_argtab  = NULL;
+    int                 p_flags   = IRXEXEC_SUBROUTINE;
+    void               *p_instblk;
+    void               *p_resv5   = NULL;
+    void               *p_evalblk = NULL;
+    void               *p_wkarea  = NULL;
+    void               *p_usrfld  = NULL;
+    void               *p_envblk;
+    int                 rexxrc    = 0;
+    IRX_ARGTABLE_ENTRY  argt[2];
+    unsigned            vexec[10];
 
-	return rc;
+    ctx.buf = (char *)malloc(HRX_OUT_MAX + 1);   /* +1 for the NUL terminator */
+    if (!ctx.buf) {
+        return send_error(httpd, httpc, 500);
+    }
+    ctx.cap = HRX_OUT_MAX;
+    ctx.len = 0;
+    ctx.overflow = 0;
+
+    ent = build_instblk(program, prog_len, &ib, &nlines);
+    if (!ent) {
+        free(ctx.buf);
+        return send_page(httpd, httpc, "");       /* empty program -> empty page */
+    }
+
+    /* --- IRXINIT: create a fresh LPE --- */
+    vinit[0] = (unsigned)fcode;
+    vinit[1] = (unsigned)&p_parmmod;
+    vinit[2] = (unsigned)&p_userfld;
+    vinit[3] = (unsigned)&p_wkblk;
+    vinit[4] = (unsigned)&p_resv;
+    vinit[5] = (unsigned)&env;
+    vinit[6] = (unsigned)&reason | 0x80000000U;   /* last slot: VL marker */
+    rc = __linkds("IRXINIT", NULL, vinit, &prc);
+    if (rc != 0 || prc != 0 || env == NULL) {
+        wtof("HTTPREXX: IRXINIT failed link=%d rc=%d", rc, prc);
+        goto done;                                /* ok stays 0 -> 500 */
+    }
+
+    /* --- overwrite the I/O routine and bind the request context --- */
+    {
+        IRX_IRXEXTE *exte = (IRX_IRXEXTE *)env->irxexte;
+        if (exte) {
+            exte->io_routine = (void *)httprexx_io;
+            exte->irxinout   = (void *)httprexx_io;
+        }
+        env->userfield = &ctx;
+    }
+
+    /* --- IRXEXEC: run the in-storage source --- */
+    p_instblk = &ib;
+    p_envblk  = env;
+    if (query && *query) {
+        argt[0].str = query;
+        argt[0].len = (int)strlen(query);
+        memset(&argt[1], 0xFF, sizeof(argt[1]));  /* 8-byte 0xFF terminator */
+        p_argtab = argt;
+    }
+    vexec[0] = (unsigned)&p_execblk;
+    vexec[1] = (unsigned)&p_argtab;
+    vexec[2] = (unsigned)&p_flags;
+    vexec[3] = (unsigned)&p_instblk;
+    vexec[4] = (unsigned)&p_resv5;
+    vexec[5] = (unsigned)&p_evalblk;
+    vexec[6] = (unsigned)&p_wkarea;
+    vexec[7] = (unsigned)&p_usrfld;
+    vexec[8] = (unsigned)&p_envblk;
+    vexec[9] = (unsigned)&rexxrc | 0x80000000U;   /* last slot: VL marker */
+    rc = __linkds("IRXEXEC", NULL, vexec, &prc);
+
+    /* --- IRXTERM: free the LPE (always, even if IRXEXEC failed). Obtain the
+     * entry via __load (the loader rexx370 uses; the as370 LOAD macro's
+     * return-code form is not honored by MVS 3.8j) and call it with R0=env. */
+    {
+        unsigned int lsize = 0;
+        char         lac   = 0;
+        void        *ep    = __load(NULL, "IRXTERM", &lsize, &lac);
+        if (ep) {
+            hrx_call(ep, env);
+            __delete("IRXTERM");
+        } else {
+            wtof("HTTPREXX: IRXTERM load failed; LPE not freed");
+        }
+    }
+
+    if (rc != 0 || prc != 0) {
+        wtof("HTTPREXX: IRXEXEC failed link=%d rc=%d rexxrc=%d", rc, prc, rexxrc);
+        goto done;
+    }
+    if (ctx.overflow) {
+        wtof("HTTPREXX: output exceeded %u bytes", (unsigned)HRX_OUT_MAX);
+        goto done;
+    }
+    ok = 1;
+
+done:
+    free(ent);
+    if (ok) {
+        ctx.buf[ctx.len] = '\0';
+        rc = send_page(httpd, httpc, ctx.buf);
+    } else {
+        rc = send_error(httpd, httpc, 500);
+    }
+    free(ctx.buf);
+    return rc;
 }
 
-static int 
-alloc_dummy(const char *ddname)
+/* ------------------------------------------------------------------ */
+/*  loader & routing                                                 */
+/* ------------------------------------------------------------------ */
+
+/* Read up to HRX_SRC_MAX bytes of a UFS file into a malloc'd buffer. */
+static char *read_ufs(UFS *ufs, const char *path, size_t *len_out)
 {
-    int         err     = 1;
-    unsigned    count   = 0;
-    TXT99       **txt99 = NULL;
-    RB99        rb99    = {0};
+    UFSFILE *fp;
+    char    *buf;
+    UINT32   n;
+    size_t   total = 0;
 
-	// wtof("%s: enter ddname=\"%s\"", __func__, ddname);
-
-	/* allocate this dd name */
-	err = __txddn(&txt99, ddname);
-    if (err) goto quit;
-
-    /* allocate dummy dataset */
-    err = __txdmy(&txt99, NULL);
-    if (err) goto quit;
-
-    count = arraycount(&txt99);
-    if (!count) goto quit;
-
-    /* Set high order bit to mark end of list */
-    count--;
-    txt99[count]    = (TXT99*)((unsigned)txt99[count] | 0x80000000);
-
-    /* construct the request block for dynamic allocation */
-    rb99.len        = sizeof(RB99);
-    rb99.request    = S99VRBAL;
-    rb99.flag1      = S99NOCNV;
-    rb99.txtptr     = txt99;
-
-    /* SVC 99 */
-    err = __svc99(&rb99);
-    if (err) goto quit;
-
-quit:
-    if (txt99) FreeTXT99Array(&txt99);
-
-	// wtof("%s: exit rc=%d", __func__, err);
-    return err;
+    if (!ufs) {
+        return NULL;
+    }
+    fp = ufs_fopen(ufs, path, "r");
+    if (!fp) {
+        return NULL;
+    }
+    buf = (char *)malloc(HRX_SRC_MAX);
+    if (!buf) {
+        ufs_fclose(&fp);
+        return NULL;
+    }
+    while (total < HRX_SRC_MAX &&
+           (n = ufs_fread(buf + total, 1, (UINT32)(HRX_SRC_MAX - total), fp)) > 0) {
+        total += n;
+    }
+    ufs_fclose(&fp);
+    *len_out = total;
+    return buf;
 }
 
-static int alloc_temp(const char *ddname)
+static int ends_with(const char *s, const char *suffix)
 {
-    int         err     = 1;
-    unsigned    count   = 0;
-    TXT99       **txt99 = NULL;
-    RB99        rb99    = {0};
-    char		tempname[40];
-
-	// wtof("%s: enter ddname=\"%s\"", __func__, ddname);
-
-	snprintf(tempname, sizeof(tempname), "&%s", ddname);
-	tempname[sizeof(tempname)-1] = 0;
-
-	/* allocate this dd name */
-	err = __txddn(&txt99, ddname);
-    if (err) goto quit;
-
-    /* allocate this dataset */
-    err = __txdsn(&txt99, tempname);
-    if (err) goto quit;
-
-    /* DISP=NEW */
-    err = __txnew(&txt99, NULL);
-    if (err) goto quit;
-
-	/* BLKSIZE=27998 */
-	err = __txbksz(&txt99, "27998");
-    if (err) goto quit;
-
-	/* LRECL=255 */
-	err = __txlrec(&txt99, "255");
-    if (err) goto quit;
-
-	/* SPACE=...(pri,sec) */
-	err = __txspac(&txt99, "15,15");
-    if (err) goto quit;
-
-	/* SPACE=CYLS */
-	err = __txcyl(&txt99, NULL);
-	if (err) goto quit;
-
-	/* RECFM=VB */
-    err = __txrecf(&txt99, "VB");
-    if (err) goto quit;
-
-	/* DSORG=PS */
-	err = __txorg(&txt99, "PS");
-    if (err) goto quit;
-    
-    count = arraycount(&txt99);
-    if (!count) goto quit;
-
-    /* Set high order bit to mark end of list */
-    count--;
-    txt99[count]    = (TXT99*)((unsigned)txt99[count] | 0x80000000);
-
-    /* construct the request block for dynamic allocation */
-    rb99.len        = sizeof(RB99);
-    rb99.request    = S99VRBAL;
-    rb99.flag1      = S99NOCNV;
-    rb99.txtptr     = txt99;
-
-    /* SVC 99 */
-    err = __svc99(&rb99);
-    if (err) goto quit;
-
-quit:
-    if (txt99) FreeTXT99Array(&txt99);
-
-	// wtof("%s: exit rc=%d", __func__, err);
-    return err;
+    size_t ls = strlen(s);
+    size_t lf = strlen(suffix);
+    return ls >= lf && strcmp(s + ls - lf, suffix) == 0;
 }
 
-static int alloc_temp_vars(const char *ddname)
+static int dispatch(HTTPD *httpd, HTTPC *httpc, const char *script)
 {
-    int         err     = 1;
-    unsigned    count   = 0;
-    TXT99       **txt99 = NULL;
-    RB99        rb99    = {0};
-    char		tempname[40];
+    CLIBCRT *crt = __crtget();
+    UFS     *ufs = crt ? (UFS *)crt->crtufs : NULL;
+    char    *src = NULL;
+    size_t   src_len = 0;
+    char    *query;
+    int      rc;
 
-	// wtof("%s: enter ddname=\"%s\"", __func__, ddname);
+    if (!script || !*script) {
+        return send_error(httpd, httpc, 404);
+    }
+    src = read_ufs(ufs, script, &src_len);
+    if (!src) {
+        return send_error(httpd, httpc, 404);
+    }
 
-	snprintf(tempname, sizeof(tempname), "&%s", ddname);
-	tempname[sizeof(tempname)-1] = 0;
+    query = http_get_env(httpc, "QUERY_STRING");
 
-	/* allocate this dd name */
-	err = __txddn(&txt99, ddname);
-    if (err) goto quit;
-
-    /* allocate this dataset */
-    err = __txdsn(&txt99, tempname);
-    if (err) goto quit;
-
-    /* DISP=NEW */
-    err = __txnew(&txt99, NULL);
-    if (err) goto quit;
-
-	/* BLKSIZE=27998 */
-	err = __txbksz(&txt99, "27998");
-    if (err) goto quit;
-
-	/* LRECL=8232 */
-	err = __txlrec(&txt99, "8232");
-    if (err) goto quit;
-
-	/* SPACE=...(pri,sec) */
-	err = __txspac(&txt99, "15,15");
-    if (err) goto quit;
-
-	/* SPACE=TRACKS */
-	err = __txtrk(&txt99, NULL);
-	if (err) goto quit;
-
-	/* RECFM=FB */
-    err = __txrecf(&txt99, "VB");
-    if (err) goto quit;
-
-	/* DSORG=PS */
-	err = __txorg(&txt99, "PS");
-    if (err) goto quit;
-    
-    count = arraycount(&txt99);
-    if (!count) goto quit;
-
-    /* Set high order bit to mark end of list */
-    count--;
-    txt99[count]    = (TXT99*)((unsigned)txt99[count] | 0x80000000);
-
-    /* construct the request block for dynamic allocation */
-    rb99.len        = sizeof(RB99);
-    rb99.request    = S99VRBAL;
-    rb99.flag1      = S99NOCNV;
-    rb99.txtptr     = txt99;
-
-    /* SVC 99 */
-    err = __svc99(&rb99);
-    if (err) goto quit;
-
-quit:
-    if (txt99) FreeTXT99Array(&txt99);
-
-	// wtof("%s: exit rc=%d", __func__, err);
-    return err;
+    if (ends_with(script, ".rxp")) {
+        char  *prog = NULL;
+        size_t prog_len = 0;
+        if (rxp_transpile(src, src_len, &prog, &prog_len) != 0) {
+            free(src);
+            return send_error(httpd, httpc, 500);
+        }
+        free(src);
+        rc = run_rexx(httpd, httpc, prog, prog_len, query);
+        free(prog);
+    } else {
+        /* .rexx (or anything routed here): run the source directly */
+        rc = run_rexx(httpd, httpc, src, src_len, query);
+        free(src);
+    }
+    return rc;
 }
 
-static int free_alloc(const char *ddname)
+/* ------------------------------------------------------------------ */
+/*  entry                                                            */
+/* ------------------------------------------------------------------ */
+
+int main(int argc, char **argv)
 {
-    int         err     = 1;
-    unsigned    count   = 0;
-    TXT99       **txt99 = NULL;
-    RB99        rb99    = {0};
+    int      rc      = 0;
+    CLIBGRT *grt     = __grtget();
+    CLIBCRT *crt     = __crtget();
+    void    *crtapp1 = NULL;
+    void    *crtapp2 = NULL;
+    void    *crtufs  = NULL;
+    HTTPD   *httpd   = grt->grtapp1;
+    HTTPC   *httpc   = grt->grtapp2;
+    char    *path    = NULL;
+    char    *script  = NULL;
 
-	// wtof("%s: enter ddname=\"%s\"", __func__, ddname);
+    if (!httpd) {
+        wtof("This program %s must be called by the HTTPD web server%s",
+             argv[0], "");
+        printf("This program %s must be called by the HTTPD web server%s",
+               argv[0], "\n");
+        return 12;
+    }
 
-    /* we want to unallocate the DDNAME */
-    err = __txddn(&txt99, ddname);
-    if (err) goto quit;
+    /* save the CRT app slots, publish httpd/httpc, init the UFS session */
+    if (crt) {
+        crtapp1      = crt->crtapp1;
+        crtapp2      = crt->crtapp2;
+        crtufs       = crt->crtufs;
+        crt->crtapp1 = httpd;
+        crt->crtapp2 = httpc;
+        crt->crtufs  = http_get_ufs(httpc);
+    }
 
-    count = arraycount(&txt99);
-    if (!count) goto quit;
+    /* Extension routing: HTTPD sets SCRIPT_FILENAME to the full UFS path for
+     * MOD=HTTPREXX *.rexx / *.rxp. Fall back to the REQUEST_PATH basename. */
+    script = http_get_env(httpc, "SCRIPT_FILENAME");
+    if (!script) {
+        path = http_get_env(httpc, "REQUEST_PATH");
+        if (path) {
+            script = strrchr(path, '/');
+        }
+        if (script && *script == '/') {
+            script++;
+        }
+    }
 
-    /* Set high order bit to mark end of list */
-    count--;
-    txt99[count]    = (TXT99*)((unsigned)txt99[count] | 0x80000000);
+    rc = dispatch(httpd, httpc, script);
 
-    /* construct the request block for dynamic allocation */
-    rb99.len        = sizeof(RB99);
-    rb99.request    = S99VRBUN;
-    rb99.flag1      = S99NOCNV;
-    rb99.txtptr     = txt99;
-
-    /* SVC 99 */
-    err = __svc99(&rb99);
-    if (err) {
-		// wtof("%s: err=%d error=0x%04X info=0x%04X", __func__, err, rb99.error, rb99.info);
-		goto quit;
-	}
-
-quit:
-    if (txt99) FreeTXT99Array(&txt99);
-
-	// wtof("%s: exit rc=%d", __func__, err);
-    return err;
+    if (crt) {
+        crt->crtapp1 = crtapp1;
+        crt->crtapp2 = crtapp2;
+        crt->crtufs  = crtufs;
+    }
+    return rc;
 }
