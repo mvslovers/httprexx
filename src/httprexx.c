@@ -17,6 +17,7 @@
 #include "clibwto.h"
 #include "clibgrt.h"
 #include "cliblink.h"
+#include "clibos.h"
 #include "libufs.h"
 #include "httpcgi.h"
 
@@ -37,8 +38,9 @@
 #define HRX_SRC_MAX  (64u * 1024u)   /* max .rexx/.rxp source read from UFS */
 #define HRX_OUT_MAX  (32u * 1024u)   /* max rendered page (buffered)        */
 
-/* The IRXTERM R0 shim (asm/htrxterm.asm). */
-extern int httprexx_irxterm(void *env) asm("HRXTERM");
+/* Call a routine with the ENVBLOCK in R0 (asm/htrxterm.asm). IRXTERM's entry
+ * point is obtained in C via __load(); this shim just calls it with R0 = env. */
+extern int hrx_call(void *ep, void *env) asm("HRXCALL");
 
 /* the CGI entry (@@CRT1 __start) calls main() */
 int main(int argc, char **argv);
@@ -284,8 +286,20 @@ static int run_rexx(HTTPD *httpd, HTTPC *httpc, char *program, size_t prog_len,
     vexec[9] = (unsigned)&rexxrc | 0x80000000U;   /* last slot: VL marker */
     rc = __linkds("IRXEXEC", NULL, vexec, &prc);
 
-    /* --- IRXTERM: free the LPE (always, even if IRXEXEC failed) --- */
-    httprexx_irxterm(env);
+    /* --- IRXTERM: free the LPE (always, even if IRXEXEC failed). Obtain the
+     * entry via __load (the loader rexx370 uses; the as370 LOAD macro's
+     * return-code form is not honored by MVS 3.8j) and call it with R0=env. */
+    {
+        unsigned int lsize = 0;
+        char         lac   = 0;
+        void        *ep    = __load(NULL, "IRXTERM", &lsize, &lac);
+        if (ep) {
+            hrx_call(ep, env);
+            __delete("IRXTERM");
+        } else {
+            wtof("HTTPREXX: IRXTERM load failed; LPE not freed");
+        }
+    }
 
     if (rc != 0 || prc != 0) {
         wtof("HTTPREXX: IRXEXEC failed link=%d rc=%d rexxrc=%d", rc, prc, rexxrc);

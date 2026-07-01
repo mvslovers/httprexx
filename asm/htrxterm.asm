@@ -1,33 +1,33 @@
-         TITLE 'HRXTERM - C-callable IRXTERM wrapper for HTTPREXX'
+         TITLE 'HRXCALL - call a routine with the ENVBLOCK in R0'
 *
-*  HRXTERM - terminate a REXX/370 Language Processor Environment.
+*  HRXCALL - call a loaded routine (IRXTERM) with R0 = ENVBLOCK.
 *
 *  Called from C (cc370) as:
-*       extern int httprexx_irxterm(void *env) asm("HRXTERM");
+*       extern int hrx_call(void *ep, void *env) asm("HRXCALL");
 *
-*  IRXTERM takes the ENVBLOCK in R0 (no parameter list), so it cannot
-*  be reached through __linkds(), which does not control R0. This shim
-*  LOADs IRXTERM at runtime (the module is installed on the system, not
-*  statically linked, so a static V-con would be unresolved under NCAL)
-*  and calls it with R0 = env.
+*  IRXTERM takes the ENVBLOCK in R0 (no parameter list), which no C
+*  calling convention nor __linkds can set. The caller obtains the
+*  IRXTERM entry point in C via __load() (the crent370/libc370 loader
+*  that rexx370 itself uses -- the as370 LOAD macro's return-code form
+*  is not honored by the MVS 3.8j SVC 8), then passes (ep, env) here.
 *
-*  Entry:  R1 -> argument list; arg0 (env) is the VALUE at 0(R1); cc370
-*               passes argument values in the R1 list (single deref).
+*  Entry:  R1 -> arg list; arg0 (ep) at 0(R1), arg1 (env) at 4(R1);
+*               cc370 passes argument values in the R1 list.
 *          R13 -> caller 72-byte save area, R14 = return, R15 = entry.
-*  Return: R15 = IRXTERM return code (0 ok, 20 bad env); -1 = LOAD fail.
+*  Return: R15 = the routine's return code.
 *
 *  Linkage modeled on rexx370 asm/istso.asm: manual OS linkage with a
-*  GETMAIN workarea (RENT/REUS) that also serves as IRXTERM's save area.
+*  GETMAIN workarea that also serves as the routine's save area.
 *
-*  NOTE: keep every statement within column 71. Column 72 is the
-*  continuation column; a comment that reaches it silently swallows the
-*  next line (this once ate the BALR that sets the base register).
+*  NOTE: keep every statement within column 71 -- column 72 is the
+*  continuation column and would swallow the next line.
 *
 *  (c) 2026 mvslovers
 *
          PRINT NOGEN
 R0       EQU   0
 R1       EQU   1
+R2       EQU   2
 R3       EQU   3
 R4       EQU   4
 R9       EQU   9
@@ -37,13 +37,14 @@ R14      EQU   14
 R15      EQU   15
          PRINT GEN
 *
-HRXTERM  CSECT
+HRXCALL  CSECT
          STM   R14,R12,12(R13)    save caller regs
          BALR  R12,0              establish base register
          USING *,R12
 *
-*  Read env (arg0) before GETMAIN/LOAD clobber R1.
-         L     R3,0(,R1)          R3 = env
+*  Read the arguments (values) before GETMAIN clobbers R1.
+         L     R2,0(,R1)          R2 = ep  (routine entry)
+         L     R3,4(,R1)          R3 = env (ENVBLOCK)
 *
 *  Acquire a dynamic workarea / save area (RENT).
          L     R0,=A(WALEN)
@@ -54,19 +55,12 @@ HRXTERM  CSECT
          LR    R13,R1
          USING WAREA,R13
 *
-*  LOAD IRXTERM, call it with R0 = env, then DELETE to balance.
-         LOAD  EP=IRXTERM,ERRET=NOLOAD
-         LR    R15,R0             R15 = IRXTERM entry
+*  Call the routine with R0 = env.
+         LR    R15,R2             R15 = ep
          LR    R0,R3              R0  = env
-         BALR  R14,R15            call IRXTERM
+         BALR  R14,R15            call the routine
          LR    R4,R15             R4  = RC (preserve)
-         DELETE EP=IRXTERM
-         B     EXIT
 *
-NOLOAD   LA    R4,1               R4 = 1
-         LCR   R4,R4              R4 = -1 (LOAD failed)
-*
-EXIT     DS    0H
          L     R13,WDPREV         R13 = caller save area
          L     R0,=A(WALEN)
          FREEMAIN RU,LV=(0),A=(9)
@@ -84,4 +78,4 @@ WDNEXT   DS    F                  +8  forward chain
          DS    15F                +12..+71 save slots
 WALEN    EQU   *-WAREA
 *
-         END   HRXTERM
+         END   HRXCALL

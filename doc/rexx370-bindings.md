@@ -165,16 +165,30 @@ Array of `argtable_entry { void *str; int len; }` terminated by 8 bytes of
 
 ---
 
-## 4. IRXTERM — tear down the LPE (needs a tiny asm glue)
+## 4. IRXTERM — tear down the LPE (load in C, call via a tiny asm shim)
 
-`IRXTERM` takes the ENVBLOCK **in R0** (no parameter list). `__linkds` cannot set
-R0, so HTTPREXX provides a minimal own-asm/inline-asm shim: LOAD `EP=IRXTERM` at
-runtime (the module is installed, not statically linked, so a static `=V` would
-not resolve under NCAL), set `R0 = env`, `BALR`. `R15` = 0 ok / 20 bad env.
+`IRXTERM` takes the ENVBLOCK **in R0** (no parameter list), which neither a C
+call nor `__linkds` can set. Two steps:
+
+1. **Obtain the entry in C** with `__load()` (clibos.h — the crent370/libc370
+   loader rexx370 itself uses). The as370 `LOAD` macro emits the "return-code
+   requested" SVC 8 form (`R1=X'80000000'`), which **MVS 3.8j does not honor** —
+   it came back with entry point 0 and branched to low core (S0C1). `__load`
+   returns a valid entry (or NULL); `__delete("IRXTERM")` balances the load.
+2. **Call it with R0 = env** through a minimal own-asm shim `HRXCALL`
+   (`asm/htrxterm.asm`) — it just sets `R0 = env`, `R15 = ep`, `BALR`, over a
+   GETMAIN'd save area. `R15` = 0 ok / 20 bad env.
 
 ```c
-int httprexx_irxterm(struct envblock *env);   /* shim: LOAD EP=IRXTERM; R0=env; BALR */
+extern int hrx_call(void *ep, void *env) asm("HRXCALL");
+void *ep = __load(NULL, "IRXTERM", &size, &ac);
+if (ep) { hrx_call(ep, env); __delete("IRXTERM"); }
 ```
+
+> Hand-written as370 pitfall (bit this shim once): keep every statement within
+> **column 71**. Column 72 is the continuation column — an inline comment that
+> reaches it silently swallows the next line (it ate the `BALR` that sets the
+> base register → garbage base → S0C1).
 
 One fresh LPE per request: IRXINIT → patch io_routine → IRXEXEC → IRXTERM, with
 the request buffer flushed to `httpc` after IRXTERM. No cross-request state.
