@@ -66,7 +66,11 @@ HRXCALL  CSECT
          FREEMAIN RU,LV=(0),A=(9)
          LR    R15,R4             R15 = return code
          L     R14,12(,R13)       restore return address
-         LM    R0,R12,20(,R13)    restore R0-R12
+*  RS format needs D(B): as370 silently assembles the RX-style
+*  D(,B) form with BASE=0, i.e. LM from PSA low core -- this was
+*  the root cause of the "IRXTERM crashes from a C host" bug
+*  (rexx370 docs/irxterm-c-host-crash.md).
+         LM    R0,R12,20(R13)     restore R0-R12
          BR    R14
 *
          LTORG

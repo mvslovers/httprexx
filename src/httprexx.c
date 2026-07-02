@@ -308,14 +308,13 @@ static int run_rexx(HTTPD *httpd, HTTPC *httpc, char *program, size_t prog_len,
     vexec[9] = (unsigned)&rexxrc | 0x80000000U;   /* last slot: VL marker */
     rc = __linkds("IRXEXEC", NULL, vexec, &prc);
 
-    /* --- IRXTERM: temporarily DISABLED. Terminating an env AFTER an IRXEXEC
-     * run S0C1s early inside IRXTERM (ttermvl only covers IRXINIT->IRXTERM with
-     * no exec in between; the entry via __load/HRXCALL is the same LOAD+BALR-R0
-     * path ttermvl uses and works there). The LPE is leaked per request until
-     * the rexx370 IRXTERM-after-IRXEXEC path is fixed; the IRXANCHR table holds
-     * ~64 slots, so a smoke test of a few requests is fine. The __load/HRXCALL
-     * code is kept below (compiled out) for a one-line re-enable. */
-#if 0
+    /* --- IRXTERM: tear down the request's LPE via __load + HRXCALL
+     * (R0 = ENVBLOCK, the documented TSO/E register interface).
+     * Re-enabled: the "S0C1 after IRXTERM" crash was never in rexx370 —
+     * it was HRXCALL's own epilog restoring R0-R12 from PSA low core
+     * because the RS-format operand was written 20(,R13) and as370
+     * silently assembles that with BASE=0.  Fixed in asm/htrxterm.asm;
+     * full analysis in rexx370 docs/irxterm-c-host-crash.md. */
     {
         unsigned int lsize = 0;
         char         lac   = 0;
@@ -325,7 +324,6 @@ static int run_rexx(HTTPD *httpd, HTTPC *httpc, char *program, size_t prog_len,
             __delete("IRXTERM");
         }
     }
-#endif
 
     if (rc != 0 || prc != 0) {
         wtof("HTTPREXX: IRXEXEC failed link=%d rc=%d rexxrc=%d", rc, prc, rexxrc);
