@@ -202,6 +202,13 @@ static int send_page(HTTPD *httpd, HTTPC *httpc, char *body, size_t len)
 {
     http_resp(httpc, 200);
     http_printf(httpc, "Content-Type: text/html\r\n");
+    /* The whole page is buffered, so the exact length is known here. Emit
+     * Content-Length (as httpd's static path does, httpget.c) rather than
+     * leaning on httpd's fallback that injects Transfer-Encoding: chunked when
+     * no length is present -- Content-Length is deterministic, keeps keep-alive
+     * without the per-chunk framing sends, and lets the client size the body.
+     * The EBCDIC->ASCII translation below is 1:1, so the byte count is stable. */
+    http_printf(httpc, "Content-Length: %u\r\n", (unsigned)len);
     http_printf(httpc, "\r\n");
     if (len) {
         http_xlate((unsigned char *)body, (int)len, httpx->xlate_1047->etoa);
@@ -322,6 +329,11 @@ static int run_rexx(HTTPD *httpd, HTTPC *httpc, char *program, size_t prog_len,
         if (ep) {
             hrx_call(ep, env);
             __delete("IRXTERM");
+        } else {
+            /* Without IRXTERM the IRXINIT LPE cannot be torn down; in a
+             * persistent worker that storage would leak per request. Log it
+             * loudly -- it means IRXTERM is not installed/reachable. */
+            wtof("HTTPREXX: __load(IRXTERM) failed -- LPE not terminated");
         }
     }
 
@@ -350,28 +362,37 @@ done:
 /*  loader & routing                                                 */
 /* ------------------------------------------------------------------ */
 
-/* Read up to HRX_SRC_MAX bytes of a UFS file into a malloc'd buffer. */
+/* Read up to HRX_SRC_MAX bytes of a UFS file into a malloc'd buffer. The buffer
+ * is sized to the file (capped at HRX_SRC_MAX) so a small script does not pin a
+ * fixed 64 KB per request -- the target is memory-constrained. If ufs_stat is
+ * unavailable or the file is at/over the cap, fall back to the full cap. */
 static char *read_ufs(UFS *ufs, const char *path, size_t *len_out)
 {
-    UFSFILE *fp;
-    char    *buf;
-    UINT32   n;
-    size_t   total = 0;
+    UFSFILE  *fp;
+    char     *buf;
+    UFSDLIST  st;
+    size_t    cap = HRX_SRC_MAX;
+    UINT32    n;
+    size_t    total = 0;
 
     if (!ufs) {
         return NULL;
+    }
+    if (ufs_stat(ufs, path, &st) == 0 && st.filesize > 0
+        && (size_t)st.filesize < HRX_SRC_MAX) {
+        cap = (size_t)st.filesize;
     }
     fp = ufs_fopen(ufs, path, "r");
     if (!fp) {
         return NULL;
     }
-    buf = (char *)malloc(HRX_SRC_MAX);
+    buf = (char *)malloc(cap);
     if (!buf) {
         ufs_fclose(&fp);
         return NULL;
     }
-    while (total < HRX_SRC_MAX &&
-           (n = ufs_fread(buf + total, 1, (UINT32)(HRX_SRC_MAX - total), fp)) > 0) {
+    while (total < cap &&
+           (n = ufs_fread(buf + total, 1, (UINT32)(cap - total), fp)) > 0) {
         total += n;
     }
     ufs_fclose(&fp);
