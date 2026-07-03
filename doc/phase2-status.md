@@ -13,7 +13,7 @@ current state is always visible.
 | # | Item | Decision | Blocked on rexx370? |
 |---|------|----------|---------------------|
 | 1 | Compiled-exec cache | **Deferred** | Yes — needs a rexx370 compiler exposed as load modules; explicitly **not in focus** upstream right now |
-| 2 | literals (make `.rxp` bytecode-compilable) | **Done** (issue #4) | No — pure transpiler (C), via literal-chunking (not the vpool-stem mechanism) |
+| 2 | literals (make `.rxp` bytecode-compilable) | **Implemented (PR #5); gated on a rexx370 fallback fix** — see "Post-impl finding" below | No for chunking itself; the safety gate needs a rexx370 change |
 | 3 | error line mapping | **Deferred** | Yes — rexx370 SIGL line tracking is deferred (always 0) |
 | 4 | EXECIO → UFS | **Deferred** | Yes — EXECIO is not implemented in rexx370 at all |
 | 5 | `http_flush` streaming valve | **Do now** | No — pure HTTPREXX, automatic buffer-threshold flush |
@@ -150,6 +150,52 @@ ground truth if we want certainty before committing. Harness + inputs in
 
 ---
 
+## Post-implementation finding — chunking can regress large pages to a fatal 500
+
+Adversarial stress testing (after the PR) found a real regression the unit tests
+missed. rexx370's bytecode compiler has **fixed, program-wide** tables
+(`irx#bcom.c`): `BCOM_MAX_CONSTS = 512`, `BCOM_MAX_CODE = 16384`. Overflowing them
+returns `IRXBC_ERR_STOR`, which is **not** in `bc_err_is_fallback()` (that covers
+only `UNSUP` / `STRTOOLONG` / `PARSE_COMPOUND`) → `irx_exec_run` returns it
+**fatally** instead of falling back to the interpreter.
+
+Chunking exposes this: before, a long HTML line produced one >63-byte constant →
+`STRTOOLONG` → graceful fallback → page renders. After, the line becomes many
+≤63-byte constants that compile *past* that point until the 512-constant table
+overflows → `IRXBC_ERR_STOR` → **fatal 500**. The table is per-program, so the
+limit is **cumulative** across the whole page.
+
+**Measured (host, distinct content so the compiler's constant dedup doesn't hide
+it):**
+- Single line: 508 distinct chunks (~32 KB) → `exec=1`, correct. 635 chunks
+  (~40 KB) → **fatal rc=20**.
+- Realistic multi-line page `page_big.rxp` (50 KB, 303 distinct lines — a report
+  with 300 entries): **OLD renders 50 477 B via fallback; NEW returns fatal
+  rc=20 (0 B).**
+
+Threshold ≈ **>512 distinct 63-byte chunks ≈ >32 KB of distinct page content**,
+cumulative. That is a plausible real page, not a pathological one.
+
+(Note: an earlier sweep with all-identical bytes wrongly suggested the limit was
+~4800 chunks / ~300 KB — the compiler **deduplicates identical constants**, hiding
+the 512-limit. Distinct content is the correct test.)
+
+**Proper fix (upstream, same pattern as the 63-byte STRTOOLONG fix):** classify
+`IRXBC_ERR_STOR` (a compile-time *capacity* limit, raised before any bytecode
+runs, so side-effect-free to retry) as fallback-eligible in rexx370's
+`bc_err_is_fallback()`. Then table overflow → graceful fallback to the interpreter
+(which has no such limits) → page renders. This benefits all rexx370 callers, not
+just HTTPREXX.
+
+**Consequence for PR #5:** chunking is a strict win only *once rexx370 falls back
+on `STOR`*. Until then, merging #5 alone trades "most pages faster" for "pages
+> ~32 KB distinct content return 500 instead of rendering." Options: (a) land the
+rexx370 `STOR`-fallback fix first, then #5 is strictly safe; (b) interim
+transpiler guard — track emitted constants and stop chunking past a safe budget
+(~400), letting the remaining long literals fall back via `STRTOOLONG` (adds
+cross-line state; conservative, since it can't see the compiler's dedup);
+(c) hold #5 until (a). **Recommendation: (a).**
+
 ## Status log
 
 - **2026-07-02** — Phase 2 read-through; established the cache's spec mechanism
@@ -161,9 +207,15 @@ ground truth if we want certainty before committing. Harness + inputs in
   ~38%/request win (not entangled with the cache); today's `.rxp` is the worst
   cell; a zero-code ~19% stopgap exists (disable bytecode on the `.rxp` route).
   **Next:** implement #2 (transpiler literal-chunking), then #5 (`http_flush`).
-- **2026-07-03** — Implemented #2 (issue #4, branch `feature/rxp-literal-chunking`):
-  `line_close_lit` in `src/rxptrans.c` now splits literals into ≤63 value-byte
-  `||`-joined chunks; 5 new tests in `test/tstrxp.c` (17/17 host tests green);
-  spec §5/§10 corrected (v1.2). End-to-end verified with the real transpiler on a
-  realistic page: old output `fallback=1` → new output `exec=1`, byte-identical
-  render. **Next:** #5 (`http_flush`).
+- **2026-07-03** — Implemented #2 (issue #4, PR #5, branch
+  `feature/rxp-literal-chunking`): `line_close_lit` in `src/rxptrans.c` splits
+  literals into ≤63 value-byte `||`-joined chunks; 5 new tests (17/17 host green);
+  spec §5/§10 corrected (v1.2). CI green. End-to-end verified on a small page:
+  old `fallback=1` → new `exec=1`, byte-identical render.
+- **2026-07-03** — Adversarial stress test (advisor-prompted) found a regression:
+  chunking a large page (>512 distinct 63-byte chunks ≈ >32 KB content) overflows
+  rexx370's program-wide constants table → `IRXBC_ERR_STOR` → **fatal 500** where
+  the unchunked page rendered via fallback. Confirmed on a realistic 50 KB page.
+  Root cause + fix in "Post-impl finding" above. **#2 is NOT done**: PR #5 needs
+  the rexx370 `STOR`-fallback fix before it is strictly safe to merge. **Next:**
+  decide the gate (recommend the upstream rexx370 fix), then #5 (`http_flush`).
