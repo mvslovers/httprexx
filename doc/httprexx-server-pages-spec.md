@@ -1,6 +1,6 @@
 # HTTPREXX Server Pages (`.rexx` / `.rxp`) — Specification
 
-**Project:** httprexx (rexx370 edition) · **Status:** Final · **Version:** 1.1
+**Project:** httprexx (rexx370 edition) · **Status:** Final · **Version:** 1.2
 **Engine:** rexx370 (TSO/E V2-compatible, modular, **reentrant**) — *not* brexx370.
 
 A CGI module that either executes `.rexx` files from the UFS directly, or renders
@@ -194,13 +194,18 @@ end
 
 **Literal escaping:** a small escaper produces valid REXX string literals (pick a quote
 character, double embedded occurrences). REXX has no `\`-escapes, so this is just
-quote-doubling.
+quote-doubling. The transpiler emits **one literal per source run**, however long — it
+does *not* split literals.
 
-**Alternative without escaping (Phase 2):** place literals in a stem set in the variable
-pool before execution (`_LIT.1`, `_LIT.2`, …) and reference them in the `SAY`
-(`say _lit.1 || (e) || _lit.2`). The HTML bytes then never pass through the REXX
-tokenizer, and the compiled program stays small. Trade-off: a cached compiled exec must
-carry its literal table alongside it.
+**Long literals are rexx370's concern, not the transpiler's (resolved).** A `SAY`
+literal longer than rexx370's 63-byte bytecode constant limit (`IRXBC_STR_MAX`) is
+handled entirely inside the engine: rexx370 #208 chunks it into ≤63-byte constants with
+`CONCAT` at compile time, and #212/#213 makes a compile-time table overflow fall back to
+the interpreter (`IRXBC_ERR_CAPACITY`) rather than abort. So transpiled `.rxp` pages are
+bytecode-compilable with no transpiler action. An earlier draft did this chunking in the
+transpiler (and, before that, proposed a `_LIT.` variable-pool stem); both were dropped —
+the transpiler shouldn't know rexx370's internal representation limits. See
+`phase2-status.md`.
 
 ### 5.1 Parser: deliberately limited scanner in Phase 1
 
@@ -329,10 +334,14 @@ with `||`); extension router; buffered output with default lazy content-type. **
 cross-request state, **no** global lock. *Goal:* `hello.rexx` and `hello.rxp` render
 end-to-end, under concurrent workers.
 
-**Phase 2 — Performance & diagnostics.** Compiled-exec cache (`cgictx` anchor, INSTBLK/
-`RX37` image keyed by path+mtime, latch); literals-in-stem; error line mapping
-(source-newline preservation); `EXECIO` (`RXFREAD_DS`/`RXFWRITE_DS`) mapped to UFS;
-`http_flush` streaming valve.
+**Phase 2 — Performance & diagnostics.** Long-literal handling for `.rxp` — **done in
+rexx370, not HTTPREXX** (#208 compile-time literal chunking + #212/#213
+`IRXBC_ERR_CAPACITY` fallback); `http_flush` streaming valve (**next**). Deferred,
+blocked on rexx370: compiled-exec cache (`cgictx` anchor, `RX37` image keyed by
+path+mtime, latch — needs `IRXBCOMP`/`IRXBEXEC` exported as load modules; re-assess now
+that `.rxp` compiles); error line mapping (needs rexx370 SIGL line tracking); `EXECIO`
+(`RXFREAD_DS`/`RXFWRITE_DS`) mapped to UFS (needs EXECIO in rexx370). See
+`phase2-status.md` for current state.
 
 **Phase 3 — Hardening & convenience.** Optional ergonomic helpers (`ADDRESS HTTP` host
 command environment via SUBCOMTB, `CHAROUT`-based newline-free emit); escaped-vs-raw output
@@ -393,6 +402,10 @@ latch; graceful degradation on `NULL`; INSTBLK reentrant-shareability to be conf
 
 ## Revision History
 
+- **1.2** — Phase 2. Long `.rxp` literals are handled in the rexx370 bytecode compiler
+  (#208 chunking + #212/#213 `IRXBC_ERR_CAPACITY` fallback), not the transpiler — §5/§10
+  updated; the transpiler stays one-literal-per-line (the transpiler-chunking attempt,
+  issue #4 / PR #5, was closed as superseded). Running state in `phase2-status.md`.
 - **1.1** — Removed all external REXX functions from the first cut. Output is plain `SAY`
   through the replaced I/O routine (single output path; the transpiler coalesces each source
   line into one `say … || …`), replacing the `_OUT` BIF. Request input via `PARSE ARG`
