@@ -13,7 +13,7 @@ current state is always visible.
 | # | Item | Decision | Blocked on rexx370? |
 |---|------|----------|---------------------|
 | 1 | Compiled-exec cache | **Deferred** | Yes — needs a rexx370 compiler exposed as load modules; explicitly **not in focus** upstream right now |
-| 2 | literals (make `.rxp` bytecode-compilable) | **Implemented (PR #5); gated on a rexx370 fallback fix** — see "Post-impl finding" below | No for chunking itself; the safety gate needs a rexx370 change |
+| 2 | literals (make `.rxp` bytecode-compilable) | **Implemented (PR #5, draft); gated on rexx370#212** — see "Post-impl finding" below | No for chunking itself; the safety gate needs rexx370#212 |
 | 3 | error line mapping | **Deferred** | Yes — rexx370 SIGL line tracking is deferred (always 0) |
 | 4 | EXECIO → UFS | **Deferred** | Yes — EXECIO is not implemented in rexx370 at all |
 | 5 | `http_flush` streaming valve | **Do now** | No — pure HTTPREXX, automatic buffer-threshold flush |
@@ -180,12 +180,17 @@ cumulative. That is a plausible real page, not a pathological one.
 ~4800 chunks / ~300 KB — the compiler **deduplicates identical constants**, hiding
 the 512-limit. Distinct content is the correct test.)
 
-**Proper fix (upstream, same pattern as the 63-byte STRTOOLONG fix):** classify
-`IRXBC_ERR_STOR` (a compile-time *capacity* limit, raised before any bytecode
-runs, so side-effect-free to retry) as fallback-eligible in rexx370's
+**Proper fix (upstream, same pattern as the 63-byte STRTOOLONG fix):** filed as
+**rexx370#212**. Classify the compile-time *capacity* overflow (raised before any
+bytecode runs, so side-effect-free to retry) as fallback-eligible in rexx370's
 `bc_err_is_fallback()`. Then table overflow → graceful fallback to the interpreter
-(which has no such limits) → page renders. This benefits all rexx370 callers, not
-just HTTPREXX.
+(which has no such limits) → page renders. Benefits all rexx370 callers.
+
+Subtlety noted in rexx370#212: `IRXBC_ERR_STOR=20` is overloaded (compile-time
+table overflow *and* real alloc failure *and* execute-time VM errors). Since
+`bc_err_is_fallback()` is consulted only on the compile return (`irx#exec.c:376`),
+execute-time `STOR` stays fatal regardless. Preferred fix there is a **distinct
+capacity code** rather than blanket-classifying `STOR`.
 
 **Consequence for PR #5:** chunking is a strict win only *once rexx370 falls back
 on `STOR`*. Until then, merging #5 alone trades "most pages faster" for "pages
@@ -219,3 +224,7 @@ cross-line state; conservative, since it can't see the compiler's dedup);
   Root cause + fix in "Post-impl finding" above. **#2 is NOT done**: PR #5 needs
   the rexx370 `STOR`-fallback fix before it is strictly safe to merge. **Next:**
   decide the gate (recommend the upstream rexx370 fix), then #5 (`http_flush`).
+- **2026-07-03** — Maintainer chose the upstream route. Filed **rexx370#212**
+  (compile-time table overflow should be fallback-eligible). Converted **PR #5 to
+  draft**, linked the blocker. #2 stays open pending rexx370#212 + redeploy.
+  **Next:** proceed with #5 (`http_flush`), which is independent of this gate.
