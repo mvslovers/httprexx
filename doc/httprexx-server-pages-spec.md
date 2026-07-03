@@ -1,6 +1,6 @@
 # HTTPREXX Server Pages (`.rexx` / `.rxp`) — Specification
 
-**Project:** httprexx (rexx370 edition) · **Status:** Final · **Version:** 1.1
+**Project:** httprexx (rexx370 edition) · **Status:** Final · **Version:** 1.2
 **Engine:** rexx370 (TSO/E V2-compatible, modular, **reentrant**) — *not* brexx370.
 
 A CGI module that either executes `.rexx` files from the UFS directly, or renders
@@ -194,13 +194,25 @@ end
 
 **Literal escaping:** a small escaper produces valid REXX string literals (pick a quote
 character, double embedded occurrences). REXX has no `\`-escapes, so this is just
-quote-doubling.
+quote-doubling. Literals over 63 bytes are additionally split into `||`-joined chunks (see
+"Literal chunking" below).
 
-**Alternative without escaping (Phase 2):** place literals in a stem set in the variable
-pool before execution (`_LIT.1`, `_LIT.2`, …) and reference them in the `SAY`
-(`say _lit.1 || (e) || _lit.2`). The HTML bytes then never pass through the REXX
-tokenizer, and the compiled program stays small. Trade-off: a cached compiled exec must
-carry its literal table alongside it.
+**Literal chunking (Phase 2, implemented — issue #4):** rexx370's bytecode compiler
+stores each string constant with a 1-byte length prefix (`IRXBC_STR_MAX = 63`), so a
+`SAY` literal longer than 63 bytes cannot be compiled and the engine falls back to the
+token-walk interpreter — which ordinary HTML lines trigger on nearly every page. The
+transpiler therefore splits each literal into chunks of at most 63 **value** bytes, each a
+quoted string joined by the same `||` (`say 'first 63…' || 'next 63…' || (e) || …`). An
+embedded `'` counts as one value byte (written doubled), so the stored constant never
+exceeds the limit. Output is byte-identical to one long literal; only literals over 63
+bytes are split. This keeps transpiled `.rxp` pages bytecode-compilable — measured ~38 %
+faster per request than the fall-back path (see `phase2-status.md`).
+
+*Superseded alternative:* an earlier draft set the literals as a `_LIT.` stem in the
+variable pool before execution. That path is **blocked** on the current rexx370 — setting
+pool variables from C needs `IRXEXCOM`, which is not an installed load module (the same
+constraint that deferred CGI-metadata pool variables in Phase 1). Chunking reaches the same
+goal with a pure transpiler change and no rexx370 dependency.
 
 ### 5.1 Parser: deliberately limited scanner in Phase 1
 
@@ -329,10 +341,12 @@ with `||`); extension router; buffered output with default lazy content-type. **
 cross-request state, **no** global lock. *Goal:* `hello.rexx` and `hello.rxp` render
 end-to-end, under concurrent workers.
 
-**Phase 2 — Performance & diagnostics.** Compiled-exec cache (`cgictx` anchor, INSTBLK/
-`RX37` image keyed by path+mtime, latch); literals-in-stem; error line mapping
-(source-newline preservation); `EXECIO` (`RXFREAD_DS`/`RXFWRITE_DS`) mapped to UFS;
-`http_flush` streaming valve.
+**Phase 2 — Performance & diagnostics.** Literal chunking (≤63-byte `SAY` literals so
+`.rxp` stays bytecode-compilable — **done**, issue #4); `http_flush` streaming valve.
+Deferred, blocked on rexx370: compiled-exec cache (`cgictx` anchor, `RX37` image keyed by
+path+mtime, latch — needs `IRXBCOMP`/`IRXBEXEC` exported as load modules); error line
+mapping (needs rexx370 SIGL line tracking); `EXECIO` (`RXFREAD_DS`/`RXFWRITE_DS`) mapped to
+UFS (needs EXECIO implemented in rexx370). See `phase2-status.md` for the current state.
 
 **Phase 3 — Hardening & convenience.** Optional ergonomic helpers (`ADDRESS HTTP` host
 command environment via SUBCOMTB, `CHAROUT`-based newline-free emit); escaped-vs-raw output
@@ -393,6 +407,11 @@ latch; graceful degradation on `NULL`; INSTBLK reentrant-shareability to be conf
 
 ## Revision History
 
+- **1.2** — Phase 2 kickoff. Implemented literal chunking (§5): `SAY` literals are split
+  into ≤63-byte `||`-joined chunks so transpiled `.rxp` stays bytecode-compilable (issue
+  #4), replacing the blocked `_LIT.`-stem-via-vpool alternative. Rewrote the §10 phase plan
+  to reflect what is unblocked (chunking, `http_flush`) versus deferred on rexx370 (cache,
+  error-line mapping, EXECIO). Running state tracked in `phase2-status.md`.
 - **1.1** — Removed all external REXX functions from the first cut. Output is plain `SAY`
   through the replaced I/O routine (single output path; the transpiler coalesces each source
   line into one `say … || …`), replacing the `_OUT` BIF. Request input via `PARSE ARG`

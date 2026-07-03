@@ -15,7 +15,11 @@
  *   - A blank literal line is preserved as `say ''`.
  *
  * Literal escaping is quote-doubling: REXX has no backslash escapes, so a
- * literal becomes a single-quoted string with embedded `'` doubled.
+ * literal becomes a single-quoted string with embedded `'` doubled. A literal
+ * longer than RXP_LIT_CHUNK value bytes is split into several such strings
+ * joined with `||`, so no single constant exceeds rexx370's bytecode literal
+ * limit (which would otherwise force a fallback to the interpreter). The joined
+ * output is byte-identical to one long literal.
  *
  * All character handling uses character literals (no hardcoded code points), so
  * the scanner is correct under both EBCDIC (cc370) and ASCII (host tests).
@@ -24,6 +28,15 @@
 
 #include <stdlib.h>
 #include <string.h>
+
+/* Maximum value bytes per emitted string literal. rexx370's bytecode compiler
+ * stores each constant with a 1-byte length prefix (IRXBC_STR_MAX in rexx370's
+ * irxexbl.h), so a literal longer than this cannot be represented and forces a
+ * fallback to the token-walk interpreter. We split long literals into chunks of
+ * at most this many *value* bytes, joined with `||`, so transpiled `.rxp` pages
+ * stay bytecode-compilable. Kept as a local constant (one integer) rather than a
+ * header dependency; must track rexx370's IRXBC_STR_MAX (issue #4). */
+#define RXP_LIT_CHUNK 63
 
 /* ------------------------------------------------------------------ */
 /*  growable byte buffer                                              */
@@ -128,32 +141,43 @@ static int is_ws(char c)
     return c == ' ' || c == '\t' || c == '\n' || c == '\r';
 }
 
-/* close the pending literal: if non-empty, escape it into a REXX single-quoted
- * string (doubling embedded quotes) and add it as a part. */
+/* close the pending literal: if non-empty, escape it into one or more REXX
+ * single-quoted string parts (doubling embedded quotes), each holding at most
+ * RXP_LIT_CHUNK value bytes so the constant stays bytecode-compilable. Chunks
+ * are joined by the caller's `||`. A literal that fits in one chunk emits a
+ * single part, identical to the unchunked form. */
 static void line_close_lit(line_t *ln)
 {
-    obuf   q;
-    size_t i;
+    size_t start;
 
     if (ln->lit.len == 0) {
         return;
     }
-    obuf_init(&q);
-    obuf_putc(&q, '\'');
-    for (i = 0; i < ln->lit.len; i++) {
-        char c = ln->lit.buf[i];
-        obuf_putc(&q, c);
-        if (c == '\'') {
-            obuf_putc(&q, '\'');
+    for (start = 0; start < ln->lit.len; start += RXP_LIT_CHUNK) {
+        obuf   q;
+        size_t end = start + RXP_LIT_CHUNK;
+        size_t i;
+
+        if (end > ln->lit.len) {
+            end = ln->lit.len;
         }
+        obuf_init(&q);
+        obuf_putc(&q, '\'');
+        for (i = start; i < end; i++) {
+            char c = ln->lit.buf[i];
+            obuf_putc(&q, c);
+            if (c == '\'') {
+                obuf_putc(&q, '\'');
+            }
+        }
+        obuf_putc(&q, '\'');
+        if (!q.err) {
+            line_add(ln, q.buf, q.len);
+        } else {
+            ln->parts.err = 1;
+        }
+        free(q.buf);
     }
-    obuf_putc(&q, '\'');
-    if (!q.err) {
-        line_add(ln, q.buf, q.len);
-    } else {
-        ln->parts.err = 1;
-    }
-    free(q.buf);
     ln->lit.len = 0;
 }
 

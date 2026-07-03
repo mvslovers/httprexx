@@ -12,6 +12,13 @@
 
 #include "rxptrans.h"
 
+/* Building blocks for the literal-chunking cases. RXP_LIT_CHUNK is 63, so these
+ * let the expected strings be written exactly at the chunk boundary. */
+#define A7  "aaaaaaa"                     /*  7 */
+#define A56 A7 A7 A7 A7 A7 A7 A7 A7       /* 56 */
+#define A62 A56 "aaaaaa"                  /* 62 */
+#define A63 A62 "a"                       /* 63 = one full chunk */
+
 /* Compare transpiler output against the expected REXX source, dumping both on
  * a mismatch so a failing case is easy to diagnose. */
 static int xp_eq(const char *in, const char *want)
@@ -130,6 +137,39 @@ int main(void)
             free(out);
         }
     }
+
+    /* 13. A literal of exactly RXP_LIT_CHUNK (63) bytes stays a single part —
+     *     boundary, must not split. */
+    CHECK(xp_eq(
+        A63 "\n",
+        "say '" A63 "'\n"),
+        "literal of exactly 63 bytes is one chunk");
+
+    /* 14. 64 bytes crosses the boundary: split into 63 + 1, joined by ||. */
+    CHECK(xp_eq(
+        A63 "a\n",
+        "say '" A63 "' || 'a'\n"),
+        "literal of 64 bytes splits into 63 + 1");
+
+    /* 15. 130 bytes -> 63 + 63 + 4. */
+    CHECK(xp_eq(
+        A63 A63 "aaaa\n",
+        "say '" A63 "' || '" A63 "' || 'aaaa'\n"),
+        "literal of 130 bytes splits into 63 + 63 + 4");
+
+    /* 16. A single quote landing as the 63rd value byte is doubled inside its
+     *     chunk (chunk size is counted in value bytes, not source bytes). */
+    CHECK(xp_eq(
+        A62 "'b\n",
+        "say '" A62 "''' || 'b'\n"),
+        "embedded quote at the chunk boundary is doubled in-chunk");
+
+    /* 17. Chunked literal composes with an expression part: the split literal
+     *     and the (expr) interleave with the same || joins. */
+    CHECK(xp_eq(
+        A63 "a<?rexx= x ?>z\n",
+        "say '" A63 "' || 'a' || (x) || 'z'\n"),
+        "chunked literal composes with an expression");
 
     return mbt_test_summary("TSTRXP");
 }
