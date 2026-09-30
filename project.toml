@@ -28,8 +28,15 @@ name = "TSTRXP"
 sources = ["test/tstrxp.c", "src/rxptrans.c"]
 
 [dependencies]
-"mvslovers/httpd" = "=4.0.0-dev"
-"mvslovers/ufsd" = "=1.0.0-dev"
+"mvslovers/httpd" = ">=4.1.0"
+"mvslovers/ufsd" = ">=1.2.2"
 
+
+[toolchain]
+# Pins the refs release.yml builds the published artifacts against; build.yml
+# deliberately keeps floating on main so a cc370/libc370 regression surfaces
+# in a PR build (mbt#68). cc370 is omitted -- it defaults to main and has no
+# releases to pin to yet.
+libc370 = "1.0.8"
 [release]
 version_files = ["VERSION"]
