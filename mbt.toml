@@ -7,7 +7,7 @@ version = "1.0.0-dev"
 [toolchain]
 mbt = "3.0"
 cc370 = "1.4.0"
-libc370 = "2.6.0"
+libc370 = "2.6.1"
 
 [build]
 
