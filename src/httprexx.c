@@ -11,16 +11,14 @@
  * rexx370 is not linked in -- only its struct layouts are reproduced locally in
  * irxbind.h. See doc/rexx370-bindings.md for the full contract.
  */
-#include "clibary.h"
-#include "clibppa.h"
-#include "clibcrt.h"
-#include "clibwto.h"
-#include "clibgrt.h"
-#include "cliblink.h"
-#include "clibos.h"
+#include <ext/array.h>
+#include <mvs/crt.h>
+#include <mvs/wto.h>
+#include <mvs/link.h>
 #include "libufs.h"
 #include "httpcgi.h"
 
+#include <stdio.h>
 #include <stdlib.h>
 #include <string.h>
 
@@ -42,7 +40,7 @@
  * point is obtained in C via __load(); this shim just calls it with R0 = env. */
 extern int hrx_call(void *ep, void *env) asm("HRXCALL");
 
-/* the CGI entry (@@CRT1 __start) calls main() */
+/* the CGI launcher (httpd.a, src/cgistart.c) calls main() */
 int main(int argc, char **argv);
 
 /* Request context, reached from httprexx_io via the ENVBLOCK user field. */
@@ -464,6 +462,8 @@ int main(int argc, char **argv)
     HTTPC   *httpc   = grt->grtapp2;
     char    *path    = NULL;
     char    *script  = NULL;
+
+    (void)argc;
 
     if (!httpd) {
         wtof("This program %s must be called by the HTTPD web server%s",

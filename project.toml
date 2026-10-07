@@ -13,11 +13,13 @@ type = "application"
 cflags = ["-std=gnu99", "-I", "include"]
 
 # ── Load module: the REXX CGI handler ───────────────────────────────
-# startup=crt1 for the threading runtime (@@CRT1), same as httplua. The CGI
-# entry calls main(); httpd/httpc come from the GRT (grtapp1/grtapp2).
+# The CGI entry calls main(); httpd/httpc come from the GRT (grtapp1/grtapp2).
 [[module]]
 name = "HTTPREXX"
-startup = "crt1"
+rent = true
+reus = true
+# @@START comes from httpd's CGI launcher in httpd.a (mvslovers/mbt#62)
+dep_startup = true
 sources = ["src/*.c", "asm/*.asm"]
 
 # ── Tests (host-runnable: make test-host) ───────────────────────────
@@ -28,15 +30,15 @@ name = "TSTRXP"
 sources = ["test/tstrxp.c", "src/rxptrans.c"]
 
 [dependencies]
-"mvslovers/httpd" = ">=4.1.0"
-"mvslovers/ufsd" = ">=1.2.2"
+"mvslovers/httpd" = ">=4.2.0-dev"
+"mvslovers/ufsd" = ">=1.4.0-dev"
 
 
 [toolchain]
 # Pins the refs release.yml builds the published artifacts against; build.yml
 # deliberately keeps floating on main so a cc370/libc370 regression surfaces
-# in a PR build (mbt#68). cc370 is omitted -- it defaults to main and has no
-# releases to pin to yet.
-libc370 = "1.0.8"
+# in a PR build (mbt#68).
+cc370 = "1.4.0"
+libc370 = "2.6.0"
 [release]
 version_files = ["VERSION"]
