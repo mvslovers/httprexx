@@ -3,10 +3,6 @@
 *.o
 *.d
 
-# Build artifacts
-*.jcl
-.build-warnings
-
 # IDE
 *.geany
 compile_commands.json
@@ -14,10 +10,9 @@ compile_commands.json
 # Environment
 .env
 
-# Build system (mbt)
+# Build state, staged dependencies and outputs (mbt)
 .mbt/
 build/
-contrib/
 dist/
 *.xmit
 
