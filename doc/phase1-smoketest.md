@@ -18,7 +18,7 @@ target can show is the IRX runtime path (IRXINIT → SAY hook → IRXEXEC → IR
    LPA, or the httpd STEPLIB). HTTPREXX LINKs/LOADs them by name at runtime.
 2. **httpd 4.0.0-dev (UFS-backed) running**, with a DOCROOT on UFS.
 3. **HTTPREXX deployed** to the httpd load library (the one httpd loads MOD=
-   modules from, e.g. `HTTPD.LINKLIBT`). `make deploy` packs and RECEIVEs into
+   modules from, e.g. `HTTPD.LINKLIBT`). `mbt deploy` packs and RECEIVEs into
    the deploy LINKLIB; copy member `HTTPREXX` from there into the httpd load
    library (IEBCOPY), then restart httpd — MOD= modules are loaded at STARTUP.
 

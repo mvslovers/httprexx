@@ -1,7 +1,7 @@
 /* tstrxp.c - host unit tests for the .rxp transpiler (rxptrans.c).
  *
- * Pure C, no MVS services: runs natively via `make test-host` (fast inner
- * loop) and as an MVS load module via `make test`. The expected REXX output is
+ * Pure C, no MVS services: runs natively via `mbt test` (fast inner
+ * loop) and as an MVS load module via `mbt test --mvs`. The expected REXX output is
  * compared byte-for-byte. All strings use character literals only, so the test
  * is correct under both ASCII (host) and EBCDIC (cc370).
  */

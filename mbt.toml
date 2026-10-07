@@ -1,0 +1,29 @@
+schema = 3
+
+[project]
+name = "httprexx"
+version = "1.0.0-dev"
+
+[toolchain]
+mbt = "3.0"
+cc370 = "1.4.0"
+libc370 = "2.6.0"
+
+[build]
+
+[module.HTTPREXX]
+dep_startup = true
+rent = true
+reus = true
+sources = ["src/*.c", "asm/*.asm"]
+
+[tests]
+rent = false
+reus = false
+
+[test.TSTRXP]
+sources = ["test/tstrxp.c", "src/rxptrans.c"]
+
+[dependencies]
+"mvslovers/httpd" = ">=4.2.0-dev"
+"mvslovers/ufsd" = ">=1.4.0-dev"
