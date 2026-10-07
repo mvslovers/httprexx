@@ -11,7 +11,6 @@
  * rexx370 is not linked in -- only its struct layouts are reproduced locally in
  * irxbind.h. See doc/rexx370-bindings.md for the full contract.
  */
-#include <ext/array.h>
 #include <mvs/crt.h>
 #include <mvs/wto.h>
 #include <mvs/link.h>
