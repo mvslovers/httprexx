@@ -3,31 +3,20 @@ schema = 3
 [project]
 name = "httprexx"
 version = "1.0.0-dev"
-# CGI handler load module (REXX Server Pages). The rexx370 IRX services are
-# resolved at runtime against the modules already installed on the system
-# (IRXINIT/IRXEXEC/IRXTERM), so rexx370 is NOT a build dependency — only its
-# headers are vendored under include/ (see doc/rexx370-bindings.md).
-kind = "application"
+
+[toolchain]
+mbt = "3.0"
+cc370 = "1.4.0"
+libc370 = "2.6.0"
 
 [build]
-# gnu99 for the CGI glue (mixed decls, // comments, snprintf, stdbool).
-# include/ (httprexx's own headers and the vendored IRX headers) is on the
-# include path by convention.
-cflags = ["-std=gnu99"]
 
-# ── Load module: the REXX CGI handler ───────────────────────────────
-# The CGI entry calls main(); httpd/httpc come from the GRT (grtapp1/grtapp2).
 [module.HTTPREXX]
+dep_startup = true
 rent = true
 reus = true
-# @@START comes from httpd's CGI launcher in httpd.a (mvslovers/mbt#62)
-dep_startup = true
 sources = ["src/*.c", "asm/*.asm"]
 
-# ── Tests (host-runnable: mbt test) ────────────────────────────────
-# The .rxp transpiler is pure C; its unit test cross-compiles and runs
-# natively for a fast inner loop, and as an MVS load module under mbt test --mvs.
-# Defaults for every test; test/**/*.c and *.asm are tests unless excluded.
 [tests]
 rent = false
 reus = false
@@ -38,11 +27,3 @@ sources = ["test/tstrxp.c", "src/rxptrans.c"]
 [dependencies]
 "mvslovers/httpd" = ">=4.2.0-dev"
 "mvslovers/ufsd" = ">=1.4.0-dev"
-
-[toolchain]
-# Pins the refs release.yml builds the published artifacts against; build.yml
-# deliberately keeps floating on main so a cc370/libc370 regression surfaces
-# in a PR build (mbt#68).
-mbt = "3.0"
-cc370 = "1.4.0"
-libc370 = "2.6.0"
